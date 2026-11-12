@@ -113,7 +113,7 @@ Bộ test chạy trên localhost: framing TCP/UDP, AES-GCM, Selective Repeat (k�
 python -m unittest discover tests -v
 ```
 
-Kết quả mong đợi: `Ran 39 tests ... OK`.
+Kết quả mong đợi: `Ran 46 tests ... OK`.
 
 ---
 
@@ -142,7 +142,7 @@ Cửa sổ gửi không còn cố định 8 chunk. `RttEstimator` tính SRTT và
 
 - Slow start: +1 chunk mỗi ACK cho tới `ssthresh`.
 - Congestion avoidance: W(t) = C·(t−K)³ + W_max, với C = 0.4 và K = ∛(W_max·(1−β)/C), β = 0.7. Mỗi ACK tiến về phía max(W_cubic, W_est). Khi cwnd đang nằm trên đường cong, nhánh TCP-friendly tăng 1/cwnd mỗi ACK.
-- Mất gói (3 ACK của chunk đứng sau một lỗ hổng): ssthresh = cwnd·β, cwnd = ssthresh, và chỉ gửi lại chunk đó (fast retransmit). Nếu cwnd chưa đạt W_max cũ thì W_max mới = cwnd·(1+β)/2 (fast convergence).
+- Mất gói (3 ACK của chunk đứng sau một lỗ hổng): ssthresh = cwnd·β, cwnd = ssthresh, và chỉ gửi lại chunk đó (fast retransmit). Nếu cwnd chưa đạt W_max cũ thì W_max mới = cwnd·(1+β)/2 (fast convergence). Trong fast recovery (base còn ≤ recovery point) ACK mới không làm cwnd tăng. Recovery kết thúc khi mọi chunk tới recovery point đã được ACK.
 - Timeout: ssthresh = cwnd·β, cwnd = 1, quay lại slow start.
 
 `WINDOW_SIZE` (64) chỉ là trần flow-control. Cửa sổ thực tế là min(cwnd, trần đó).
@@ -153,7 +153,7 @@ Cửa sổ gửi không còn cố định 8 chunk. `RttEstimator` tính SRTT và
 
 Mỗi lần đăng nhập client tạo một cặp khóa X25519 mới.
 
-- Handshake: client gửi khóa công khai, server trả khóa tạm của kết nối. Hai bên tính khóa kênh bằng HKDF-SHA256. Mật khẩu và UDP token đi trong kênh này.
+- Handshake: client gửi khóa công khai, server trả khóa tạm của kết nối. Hai bên tính khóa kênh bằng HKDF-SHA256. Mật khẩu đi trong kênh này. Khóa HMAC cho heartbeat UDP là một khóa dẫn xuất khác (`udp-heartbeat`), không phải token gửi rõ.
 - Chat unicast và từng file dùng khóa riêng của đúng cặp peer (`context` là `chat` hoặc `file:<stream_id>`). Broadcast là một ciphertext cho mỗi peer đang online, không phải một khóa chung.
 - Chunk file gắn thêm AAD (stream id, chỉ số chunk, tổng số chunk) nên không đổi chỗ các chunk cho nhau được.
 - Server không có khóa riêng của peer và không gọi giải mã trên chat hay file.
@@ -168,7 +168,7 @@ Server bind UDP 8889 và chạy vòng nhận. `FILE_ANNOUNCE` đăng ký route `
 
 ### 7.4. Gói FIN (Type = 3)
 
-Khi mọi chunk đã được ACK, sender gửi FIN. Receiver trả ACK với cờ `FLAG_FIN` rồi xóa trạng thái nhận. Sender gửi lại FIN vài lần nếu ACK mất. Hủy giữa chừng thì FIN mang `FLAG_ABORT`: receiver bỏ dữ liệu dở và không ghép file.
+Khi mọi chunk đã được ACK, sender gửi FIN. Receiver trả ACK với cờ `FLAG_FIN` rồi xóa trạng thái nhận. Sender gửi lại FIN nếu ACK mất; mỗi lần chờ lâu gấp đôi (tối đa 3 giây), tối đa 5 lần. Hủy giữa chừng hoặc gửi thất bại thì cùng handshake đó với `FLAG_ABORT`. Receiver luôn ACK FIN hủy (kể cả lần gửi lại), đánh dấu hủy và xóa trạng thái, không ghép file. FIN thường bị bỏ qua nếu file còn thiếu chunk.
 
 ### 7.5. Đăng nhập bằng mật khẩu
 
@@ -176,7 +176,9 @@ Khi mọi chunk đã được ACK, sender gửi FIN. Receiver trả ACK với c�
 
 ### 7.6. Heartbeat và discovery trên UDP
 
-Đúng theo mục Techniques của đề, client gửi heartbeat UDP (type 4) tới cổng 8889, kèm token bí mật nhận lúc login. Server kiểm tra token (so sánh thời gian hằng số), cập nhật thời điểm sống, và ghi địa chỉ nguồn thật của gói — đây là địa chỉ dùng cho relay khi NAT đổi cổng. Server trả heartbeat ACK (type 5).
+Đúng theo mục Techniques của đề, client gửi heartbeat UDP (type 4) tới cổng 8889. Thân gói được HMAC-SHA256 bằng khóa suy ra từ handshake X25519 (`context` là `udp-heartbeat`), kèm bộ đếm tăng dần để chặn replay. Token đăng nhập không nằm trong gói UDP. Server kiểm tra MAC. Nếu gói đến từ đúng địa chỉ đã xác nhận thì chỉ cập nhật thời điểm sống. Nếu địa chỉ nguồn là mới, server gửi một challenge (ACK type 5) và chỉ ghi `udp_addr` khi client gửi lại challenge đó từ cùng địa chỉ, trong một heartbeat mới. Token rõ hoặc gói replay không đổi được địa chỉ relay.
+
+Relay file chỉ chuyển DATA, ACK và FIN giữa hai đầu đã đăng ký cho `stream_id`. Địa chỉ nguồn phải trùng địa chỉ UDP đã xác thực của đúng người gửi hướng đó. Gói từ địa chỉ khác bị bỏ, và relay không tự học địa chỉ từ gói file.
 
 Danh bạ (ai đang online, khóa công khai) vẫn đi trên TCP vì cần tin cậy. Nếu vài chu kỳ không thấy pong UDP, client gửi thêm `HEARTBEAT_PING` trên TCP để watchdog 15 giây không đá nhầm máy bị chặn UDP. Watchdog vẫn xóa session im lặng quá 15 giây và báo `USER_LEFT`.
 

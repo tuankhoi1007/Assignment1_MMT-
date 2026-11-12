@@ -23,8 +23,13 @@ class UserSession:
         self.authenticated = False
         self.lock = threading.RLock()
         self.pubkey = pubkey
-        self.udp_token = secrets.token_hex(16)
-        self.udp_addr = None  # (ip, port) observed on a UDP heartbeat (may differ under NAT)
+        self.udp_token = secrets.token_hex(16)  # legacy secret; UDP heartbeats no longer carry it
+        self.heartbeat_key = None  # HMAC key derived from the login X25519 handshake
+        self.hb_counter = 0
+        self.pending_challenge = None
+        self.pending_challenge_addr = None
+        self.pending_challenge_until = 0.0
+        self.udp_addr = None  # (ip, port) confirmed by an authenticated heartbeat
         self.guest = False
 
     def to_dict(self):
@@ -77,7 +82,7 @@ class UserManager:
             return [s for s in self._users.values() if s.authenticated]
 
     def update_heartbeat(self, username, udp_addr=None):
-        """Refresh last-active time, and the observed UDP address when the ping came over UDP."""
+        """Refresh last-active time. Pass udp_addr only after that source has been authenticated."""
         with self._lock:
             user = self._users.get(username)
             if user:

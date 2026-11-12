@@ -12,6 +12,7 @@ import hmac
 import json
 import logging
 import os
+import secrets
 import socket
 import sys
 import threading
@@ -23,12 +24,14 @@ from protocol.packet import Packet, MsgType, PacketFlags, send_packet, recv_pack
 from protocol.crypto import KeyPair
 from protocol.udp_stream import (
     UDPPacket, TYPE_DATA, TYPE_ACK, TYPE_FIN, TYPE_HEARTBEAT, TYPE_HEARTBEAT_ACK,
+    verify_heartbeat,
 )
 from server.user_manager import UserManager
 from server.credentials import CredentialStore
 
 MAX_USERNAME_LEN = 32
 RELAY_STREAM_IDLE_SEC = 120.0
+HEARTBEAT_CHALLENGE_TTL = 2.0
 
 logger = logging.getLogger("CollaborationServer")
 
@@ -168,6 +171,7 @@ class CollaborationServer:
         sock.settimeout(self.pre_auth_timeout)
         current_user = None
         channel = None
+        heartbeat_key = None
         client_pub = None
 
         try:
@@ -186,9 +190,11 @@ class CollaborationServer:
                     ack_data = {"server": "CO3093-RelayServer", "udp_port": self.udp_port}
                     client_pub = _parse_client_pubkey(packet.payload)
                     channel = None
+                    heartbeat_key = None
                     if client_pub:
                         server_keys = KeyPair()
                         channel = server_keys.derive(client_pub, "client-server")
+                        heartbeat_key = server_keys.derive(client_pub, "udp-heartbeat").key
                         ack_data["pubkey"] = server_keys.public_b64
                     send_packet(sock, Packet.json_payload(MsgType.HANDSHAKE_ACK, ack_data))
 
@@ -207,6 +213,7 @@ class CollaborationServer:
                     current_user = username
                     session.authenticated = True
                     session.guest = guest
+                    session.heartbeat_key = heartbeat_key
                     # UDP heartbeats do not touch this socket. A recv timeout here
                     # would drop a live session that never needs to send TCP.
                     sock.settimeout(None)
@@ -268,10 +275,14 @@ class CollaborationServer:
                     data["sender_pubkey"] = client_pub
                     stream_id = data.get("stream_id")
                     if isinstance(stream_id, int) and target_user:
+                        sender_session = self.user_manager.get_user(current_user)
+                        target_session = self.user_manager.get_user(target_user)
                         with self.relay_lock:
                             self.relay_streams[stream_id] = {
                                 "sender": current_user,
                                 "target": target_user,
+                                "sender_pin": self._login_endpoint(sender_session),
+                                "target_pin": self._login_endpoint(target_session),
                                 "last": time.time(),
                             }
                     self._log(f"[File] {current_user} -> {target_user}: {data.get('filename', '')}")
@@ -367,48 +378,124 @@ class CollaborationServer:
             elif pkt.pkt_type in (TYPE_DATA, TYPE_ACK, TYPE_FIN):
                 self._relay_udp(pkt, raw, addr)
 
+    def _send_heartbeat_ack(self, addr, challenge):
+        """Pong, or a challenge the client must echo from this same source address."""
+        if challenge:
+            payload = json.dumps({"challenge": challenge}).encode("utf-8")
+        else:
+            payload = b"PONG"
+        try:
+            self.udp_sock.sendto(UDPPacket(TYPE_HEARTBEAT_ACK, 0, 0, 0, payload).encode(), addr)
+        except OSError:
+            pass
+
     def _handle_udp_heartbeat(self, pkt, addr):
-        """Refresh liveness and remember the source address the packet actually came from."""
+        """
+        Refresh liveness from an HMAC'd heartbeat.
+
+        A cleartext token is ignored. The source address becomes the relay address
+        only after a challenge issued for that address is echoed in a later heartbeat.
+        A repeat from the address already on file needs no challenge.
+        """
         try:
             data = json.loads(pkt.payload.decode("utf-8"))
         except Exception:
             return
-        username = data.get("username", "")
-        session = self.user_manager.get_user(username)
-        token = str(data.get("token", ""))
-        if not session or not hmac.compare_digest(token, session.udp_token):
+        if not isinstance(data, dict):
             return
-        self.user_manager.update_heartbeat(username, udp_addr=addr)
-        pong = UDPPacket(TYPE_HEARTBEAT_ACK, 0, pkt.chunk_idx, 0, b"PONG")
+        username = str(data.get("username", ""))
+        session = self.user_manager.get_user(username)
+        if not session or not session.heartbeat_key or not verify_heartbeat(session.heartbeat_key, data):
+            return
         try:
-            self.udp_sock.sendto(pong.encode(), addr)
-        except OSError:
-            pass
+            counter = int(data.get("counter", 0))
+        except (TypeError, ValueError):
+            return
+        if counter <= session.hb_counter:
+            return
+        challenge = str(data.get("challenge") or "")
+        now = time.time()
+        pending = (
+            session.pending_challenge
+            and session.pending_challenge_addr == addr
+            and now <= session.pending_challenge_until
+        )
+        answered = False
+        if pending and challenge:
+            answered = hmac.compare_digest(challenge, session.pending_challenge) if len(challenge) == len(session.pending_challenge) else False
+        if answered:
+            session.hb_counter = counter
+            session.pending_challenge = None
+            session.pending_challenge_addr = None
+            self.user_manager.update_heartbeat(username, udp_addr=addr)
+            self._send_heartbeat_ack(addr, None)
+            return
+        if session.udp_addr == addr:
+            session.hb_counter = counter
+            session.pending_challenge = None
+            session.pending_challenge_addr = None
+            self.user_manager.update_heartbeat(username)
+            self._send_heartbeat_ack(addr, None)
+            return
+        # Authenticated, but from an address we have not confirmed. Do not move udp_addr.
+        session.hb_counter = counter
+        self.user_manager.update_heartbeat(username)
+        if not pending:
+            session.pending_challenge = secrets.token_hex(16)
+            session.pending_challenge_addr = addr
+            session.pending_challenge_until = now + HEARTBEAT_CHALLENGE_TTL
+        self._send_heartbeat_ack(addr, session.pending_challenge)
+
+    def _login_endpoint(self, session):
+        """Address advertised at login, used only until a heartbeat confirms one."""
+        if session is None or not session.udp_port:
+            return None
+        return (session.ip, int(session.udp_port))
+
+    def _registered_endpoint(self, session, pin):
+        """
+        Where a registered stream endpoint may send from.
+        Prefer the address proved by a heartbeat. Never the source of the file packet itself.
+        """
+        if session is not None and session.udp_addr:
+            return (session.udp_addr[0], int(session.udp_addr[1]))
+        if pin:
+            return (pin[0], int(pin[1]))
+        return None
 
     def _relay_udp(self, pkt, raw, src_addr):
         """
-        Forward one file packet unchanged. DATA and FIN go sender -> target,
-        ACK goes target -> sender. The payload is end-to-end encrypted.
+        Forward one file packet unchanged between the two users registered for this stream.
+
+        DATA and FIN go sender -> target, ACK goes target -> sender. The source must be
+        that user's authenticated UDP address. A packet from anywhere else is dropped,
+        and this path does not learn a new address.
         """
         with self.relay_lock:
             route = self.relay_streams.get(pkt.stream_id)
             if not route:
                 return
-            route["last"] = time.time()
         forward_to_target = pkt.pkt_type in (TYPE_DATA, TYPE_FIN)
         source_name = route["sender"] if forward_to_target else route["target"]
         dest_name = route["target"] if forward_to_target else route["sender"]
+        src_pin = route.get("sender_pin") if forward_to_target else route.get("target_pin")
+        dst_pin = route.get("target_pin") if forward_to_target else route.get("sender_pin")
         src_session = self.user_manager.get_user(source_name)
         dst_session = self.user_manager.get_user(dest_name)
         if not src_session or not dst_session:
             return
-        if src_session.udp_addr is None:
-            src_session.udp_addr = src_addr
-        elif src_session.udp_addr != src_addr:
+        expected_src = self._registered_endpoint(src_session, src_pin)
+        expected_dst = self._registered_endpoint(dst_session, dst_pin)
+        if expected_src is None or expected_dst is None:
             return
-        dest = dst_session.udp_addr or (dst_session.ip, dst_session.udp_port)
+        if (src_addr[0], int(src_addr[1])) != expected_src:
+            return
+        with self.relay_lock:
+            current = self.relay_streams.get(pkt.stream_id)
+            if current is not None:
+                current["last"] = time.time()
         try:
-            self.udp_sock.sendto(raw, dest)
+            self.udp_sock.sendto(raw, expected_dst)
             self.relayed_packets += 1
         except OSError:
             pass

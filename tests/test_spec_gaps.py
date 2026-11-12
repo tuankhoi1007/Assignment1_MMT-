@@ -21,11 +21,12 @@ from cryptography.exceptions import InvalidTag
 import protocol.crypto as crypto_mod
 from protocol.crypto import KeyPair, CryptoManager
 from protocol.packet import Packet, MsgType, send_packet, recv_packet
+import protocol.udp_stream as udp_mod
 from protocol.udp_stream import (
     BbrLite, CongestionController, RttEstimator, StreamReceiver, StreamSender, UDPPacket,
     CUBIC_BETA, CUBIC_C, FLAG_ABORT, FLAG_FIN, INITIAL_CWND, MAX_RTO, MIN_RTO, MIN_SSTHRESH,
     TYPE_ACK, TYPE_DATA, TYPE_FIN, TYPE_HEARTBEAT,
-    chunk_aad,
+    build_heartbeat, chunk_aad,
 )
 from server.credentials import CredentialStore
 from server.server import CollaborationServer
@@ -207,6 +208,32 @@ class TestCongestionControl(unittest.TestCase):
         fresh.handle_ack(0)
         self.assertIsNone(fresh.rtt.srtt)
 
+    def test_no_cwnd_growth_during_fast_recovery(self):
+        """ACKs must not inflate cwnd while base is still at or below the recovery point."""
+        sender = StreamSender(QueuePipe(queue.Queue()), ("x", 1), 14, os.urandom(10 * 1200))
+        sender.next_seq = 6
+        sender.cc.cwnd = 9.10
+        # Slow start would add a whole chunk per ACK. Recovery must suppress that.
+        sender.cc.ssthresh = 100.0
+        sender.cc.w_max = 9.10
+        sender.cc.epoch_start = time.time()
+        sender.recovery_point = 5
+        sender.base = 0
+        before = sender.cc.cwnd
+        for idx in (1, 2, 3, 4, 5):
+            sender.handle_ack(idx)
+            self.assertEqual(sender.cc.cwnd, before)
+            self.assertEqual(sender.recovery_point, 5)
+        # Acknowledging the recovery point while an earlier hole remains is still recovery.
+        self.assertIn(5, sender.acked)
+        self.assertEqual(sender.base, 0)
+        sender.handle_ack(0)
+        self.assertGreater(sender.base, 5)
+        self.assertEqual(sender.recovery_point, -1)
+        self.assertEqual(sender.cc.cwnd, before)
+        sender.handle_ack(6)
+        self.assertAlmostEqual(sender.cc.cwnd, before + 1.0)
+
     def test_bbr_lite_follows_bdp_and_ignores_aimd(self):
         bbr = BbrLite()
         t0 = 1000.0
@@ -274,6 +301,112 @@ class TestFin(unittest.TestCase):
         self.assertEqual(pkt.pkt_type, TYPE_FIN)
         self.assertTrue(pkt.flags & FLAG_ABORT)
         self.assertTrue(sender.aborted)
+        if sender._fin_thread is not None:
+            sender.closed = True
+            sender._fin_thread.join(timeout=1)
+
+    def test_abort_fin_retries_with_backoff_until_acked(self):
+        """A lost abort FIN is retransmitted with exponential backoff, and stops once ACK'd."""
+        packets = []
+        clock = {"t": 1000.0}
+        sender_holder = {}
+
+        class Pipe:
+            def sendto(self, data, addr):
+                packets.append((clock["t"], data))
+                if len(packets) == 2:
+                    sender_holder["sender"].handle_ack(0, FLAG_FIN)
+
+        sender = StreamSender(Pipe(), ("x", 1), 23, os.urandom(100), encrypt=False)
+        sender_holder["sender"] = sender
+        sender.rtt.rto = 0.2
+        sender.fin_retries = 4
+        old_time, old_sleep = udp_mod.time.time, udp_mod.time.sleep
+        udp_mod.time.time = lambda: clock["t"]
+        udp_mod.time.sleep = lambda dt: clock.__setitem__("t", clock["t"] + dt)
+        try:
+            sender.cancel()
+            self.assertIsNotNone(sender._fin_thread)
+            sender._fin_thread.join(timeout=2)
+        finally:
+            udp_mod.time.time = old_time
+            udp_mod.time.sleep = old_sleep
+        self.assertTrue(sender.closed)
+        self.assertEqual(len(packets), 2)
+        gaps = packets[1][0] - packets[0][0]
+        self.assertAlmostEqual(gaps, 0.2, delta=0.01)
+        for _stamp, raw in packets:
+            pkt = UDPPacket.decode(raw)
+            self.assertEqual(pkt.pkt_type, TYPE_FIN)
+            self.assertTrue(pkt.flags & FLAG_ABORT)
+
+        packets.clear()
+        clock["t"] = 2000.0
+        lone = StreamSender(Pipe(), ("x", 1), 24, os.urandom(100), encrypt=False)
+        lone.rtt.rto = 0.2
+        lone.fin_retries = 4
+        udp_mod.time.time = lambda: clock["t"]
+        udp_mod.time.sleep = lambda dt: clock.__setitem__("t", clock["t"] + dt)
+        try:
+            lone._fin_handshake(FLAG_ABORT)
+        finally:
+            udp_mod.time.time = old_time
+            udp_mod.time.sleep = old_sleep
+        self.assertEqual(len(packets), 4)
+        gaps = [packets[i + 1][0] - packets[i][0] for i in range(3)]
+        self.assertAlmostEqual(gaps[0], 0.2, delta=0.01)
+        self.assertAlmostEqual(gaps[1], 0.4, delta=0.01)
+        self.assertAlmostEqual(gaps[2], 0.8, delta=0.01)
+
+    def test_failed_send_uses_abort_handshake(self):
+        sender = StreamSender(QueuePipe(queue.Queue()), ("x", 1), 25, os.urandom(100))
+        sender.failed = True
+        sender.running = False
+        seen = {}
+
+        def fake_fin(flags=0):
+            seen["flags"] = flags
+
+        sender._fin_handshake = fake_fin
+        sender.send_loop()
+        self.assertEqual(seen["flags"], FLAG_ABORT)
+
+    def test_receiver_acks_abort_fin_and_tears_down(self):
+        client = CollaborationClient()
+        sent = []
+
+        class Sock:
+            def sendto(self, data, addr):
+                sent.append((data, addr))
+
+        client.udp_sock = Sock()
+        receiver = StreamReceiver(7, 4)
+        receiver.put_chunk(0, b"partial", False)
+        client.active_receivers[7] = receiver
+        client.transfers[7] = {"role": "receiver", "progress": 25.0, "status": "Receiving"}
+        abort = UDPPacket(TYPE_FIN, 7, 4, 4, flags=FLAG_ABORT)
+        client._handle_fin(abort, ("127.0.0.1", 9))
+        self.assertNotIn(7, client.active_receivers)
+        self.assertTrue(receiver.aborted)
+        self.assertTrue(client.transfers[7]["closed"])
+        self.assertEqual(client.transfers[7]["status"], "Cancelled by sender")
+        ack = UDPPacket.decode(sent[-1][0])
+        self.assertEqual(ack.pkt_type, TYPE_ACK)
+        self.assertTrue(ack.flags & FLAG_FIN)
+        self.assertTrue(ack.flags & FLAG_ABORT)
+        self.assertEqual(sent[-1][1], ("127.0.0.1", 9))
+
+        sent.clear()
+        client._handle_fin(abort, ("127.0.0.1", 9))
+        self.assertEqual(len(sent), 1, "a repeated abort FIN is still acknowledged")
+
+        sent.clear()
+        client.active_receivers[8] = StreamReceiver(8, 2)
+        client.transfers[8] = {"role": "receiver", "progress": 0.0, "status": "Receiving"}
+        early = UDPPacket(TYPE_FIN, 8, 2, 2)
+        client._handle_fin(early, ("127.0.0.1", 9))
+        self.assertIn(8, client.active_receivers)
+        self.assertEqual(sent, [])
 
 
 class TestCredentials(unittest.TestCase):
@@ -483,6 +616,29 @@ class TestSpecGapsIntegration(unittest.TestCase):
         finally:
             self.server.pre_auth_timeout = previous
 
+    def test_heartbeat_packet_does_not_carry_the_token(self):
+        client = CollaborationClient()
+        client.username = "alice"
+        client.heartbeat_key = b"k" * 32
+        client.udp_port = 5
+        client.server_host = "127.0.0.1"
+        client.server_udp_port = 9
+        client.udp_token = "secret-token-value"
+        sent = []
+
+        class Sock:
+            def sendto(self, data, addr):
+                sent.append(data)
+
+        client.udp_sock = Sock()
+        client._send_udp_heartbeat()
+        self.assertEqual(len(sent), 1)
+        self.assertNotIn(b"secret-token-value", sent[0])
+        self.assertNotIn(b"token", sent[0])
+        body = json.loads(UDPPacket.decode(sent[0]).payload.decode("utf-8"))
+        self.assertIn("mac", body)
+        self.assertNotIn("token", body)
+
     def test_forged_udp_heartbeat_is_ignored(self):
         self._client("HB_Victim", hb=30)
         session = self.server.user_manager.get_user("HB_Victim")
@@ -496,6 +652,61 @@ class TestSpecGapsIntegration(unittest.TestCase):
             self.assertEqual(session.udp_addr, real_addr)
         finally:
             forger.close()
+
+    def test_stolen_token_cannot_take_over_relay_address(self):
+        """A heartbeat that only knows the old cleartext token must not move udp_addr."""
+        client = self._client("HB_Owner", hb=0.2)
+        session = self.server.user_manager.get_user("HB_Owner")
+        self.assertTrue(self._wait(lambda: session.udp_addr is not None, 3))
+        real_addr = session.udp_addr
+        stolen = session.udp_token
+        self.assertTrue(stolen)
+
+        attacker = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(attacker.close)
+        legacy = json.dumps({
+            "username": "HB_Owner", "token": stolen, "udp_port": 9,
+        }).encode("utf-8")
+        attacker.sendto(UDPPacket(TYPE_HEARTBEAT, 0, 1, 0, legacy).encode(), ("127.0.0.1", self.udp_port))
+        time.sleep(0.3)
+        self.assertEqual(session.udp_addr, real_addr)
+
+        replay = build_heartbeat(session.heartbeat_key, "HB_Owner", 1, 9, "")
+        attacker.sendto(UDPPacket(TYPE_HEARTBEAT, 0, 1, 0, replay).encode(), ("127.0.0.1", self.udp_port))
+        fresh = build_heartbeat(session.heartbeat_key, "HB_Owner", session.hb_counter + 5, 9, "")
+        attacker.sendto(UDPPacket(TYPE_HEARTBEAT, 0, 99, 0, fresh).encode(), ("127.0.0.1", self.udp_port))
+        time.sleep(0.3)
+        self.assertEqual(session.udp_addr, real_addr)
+        self.assertNotEqual(attacker.getsockname(), real_addr)
+
+    def test_relay_drops_packets_that_are_not_from_a_registered_endpoint(self):
+        server = CollaborationServer(host="127.0.0.1", tcp_port=0, udp_port=0, verbose=False)
+        self.addCleanup(server.udp_sock.close)
+        alice_tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        bob_tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(alice_tcp.close)
+        self.addCleanup(bob_tcp.close)
+        self.addCleanup(server.tcp_sock.close)
+        alice = server.user_manager.add_user("RelA", alice_tcp, ("127.0.0.1", 1), udp_port=41001)
+        bob = server.user_manager.add_user("RelB", bob_tcp, ("127.0.0.1", 2), udp_port=41002)
+        alice.authenticated = True
+        bob.authenticated = True
+        alice.udp_addr = ("127.0.0.1", 41001)
+        bob.udp_addr = ("127.0.0.1", 41002)
+        server.relay_streams[5] = {
+            "sender": "RelA",
+            "target": "RelB",
+            "sender_pin": ("127.0.0.1", 41001),
+            "target_pin": ("127.0.0.1", 41002),
+            "last": time.time(),
+        }
+        raw = UDPPacket(TYPE_DATA, 5, 0, 1, b"x").encode()
+        pkt = UDPPacket.decode(raw)
+        server._relay_udp(pkt, raw, ("127.0.0.1", 9))
+        self.assertEqual(server.relayed_packets, 0)
+        self.assertEqual(alice.udp_addr, ("127.0.0.1", 41001))
+        server._relay_udp(pkt, raw, ("127.0.0.1", 41001))
+        self.assertEqual(server.relayed_packets, 1)
 
     def test_web_ui_has_password_and_relay_controls(self):
         from client.web_server import RawSocketHTTPServer

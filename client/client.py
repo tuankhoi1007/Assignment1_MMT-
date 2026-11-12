@@ -17,7 +17,7 @@ import time
 from protocol.packet import Packet, MsgType, PacketFlags, send_packet, recv_packet
 from protocol.crypto import KeyPair
 from protocol.udp_stream import (
-    UDPPacket, StreamSender, StreamReceiver,
+    UDPPacket, StreamSender, StreamReceiver, build_heartbeat,
     TYPE_DATA, TYPE_ACK, TYPE_FIN, TYPE_HEARTBEAT, TYPE_HEARTBEAT_ACK,
     FLAG_FIN, FLAG_ABORT, FLAG_ENCRYPTED,
 )
@@ -45,6 +45,8 @@ class CollaborationClient:
 
         self.keys = None
         self.channel = None
+        self.heartbeat_key = None
+        self.hb_counter = 0
         self.udp_token = None
         self._peer_cryptos = {}
 
@@ -128,6 +130,8 @@ class CollaborationClient:
             self.server_udp_port = int(ack_data.get("udp_port", 8889))
             server_pub = ack_data.get("pubkey")
             self.channel = self.keys.derive(server_pub, "client-server") if server_pub else None
+            self.heartbeat_key = self.keys.derive(server_pub, "udp-heartbeat").key if server_pub else None
+            self.hb_counter = 0
 
             auth_data = {"username": username, "udp_port": self.udp_port}
             if password is not None:
@@ -536,6 +540,9 @@ class CollaborationClient:
                     self._handle_fin(pkt, addr)
                 elif pkt.pkt_type == TYPE_HEARTBEAT_ACK:
                     self.last_udp_pong = time.time()
+                    challenge = self._challenge_from_ack(pkt.payload)
+                    if challenge:
+                        self._send_udp_heartbeat(challenge=challenge)
             except (ConnectionResetError, ConnectionRefusedError):
                 continue
             except OSError:
@@ -544,18 +551,22 @@ class CollaborationClient:
                 continue
 
     def _handle_fin(self, pkt, addr):
-        """ACK a FIN once every chunk is in, and drop the receiver state."""
+        """ACK every FIN. Abort tears the stream down; a normal FIN waits until the file is complete."""
         sid = pkt.stream_id
         with self.lock:
             receiver = self.active_receivers.get(sid)
             info = self.transfers.get(sid)
         if pkt.flags & FLAG_ABORT:
             with self.lock:
-                self.active_receivers.pop(sid, None)
-                if info is not None and info.get("progress", 0) < 100.0:
-                    info["status"] = "Cancelled by sender"
+                receiver = self.active_receivers.pop(sid, None)
+                if receiver is not None:
+                    receiver.aborted = True
+                info = self.transfers.get(sid)
                 if info is not None:
+                    if info.get("progress", 0) < 100.0:
+                        info["status"] = "Cancelled by sender"
                     info["closed"] = True
+            self._ack_fin(pkt, addr, abort=True)
             return
         if receiver is not None and not receiver.is_complete():
             return
@@ -564,16 +575,22 @@ class CollaborationClient:
             self._finalize_received_file(sid, receiver)
         if receiver is None and (info is None or info.get("role") != "receiver"):
             return
-        fin_ack = UDPPacket(TYPE_ACK, sid, pkt.chunk_idx, pkt.total_chunks, flags=FLAG_FIN)
-        try:
-            self.udp_sock.sendto(fin_ack.encode(), addr)
-        except OSError:
-            pass
+        self._ack_fin(pkt, addr, abort=False)
         with self.lock:
             self.active_receivers.pop(sid, None)
             info = self.transfers.get(sid)
             if info is not None:
                 info["closed"] = True
+
+    def _ack_fin(self, pkt, addr, abort=False):
+        """ACK a FIN. Abort ACKs carry FLAG_ABORT as well as FLAG_FIN."""
+        flags = FLAG_FIN | (FLAG_ABORT if abort else 0)
+        fin_ack = UDPPacket(TYPE_ACK, pkt.stream_id, pkt.chunk_idx, pkt.total_chunks, flags=flags)
+        try:
+            if self.udp_sock is not None:
+                self.udp_sock.sendto(fin_ack.encode(), addr)
+        except OSError:
+            pass
 
     def _finalize_received_file(self, stream_id, receiver):
         """Reassemble, check the whole-file SHA-256, and write client/downloads/."""
@@ -600,10 +617,32 @@ class CollaborationClient:
         except Exception as e:
             logger.error(f"Error finalizing received file: {e}")
 
-    def _send_udp_heartbeat(self):
-        """UDP heartbeat. The server records the source address for relay and discovery."""
-        body = json.dumps({"username": self.username, "token": self.udp_token, "udp_port": self.udp_port}).encode("utf-8")
-        ping = UDPPacket(TYPE_HEARTBEAT, 0, self._next_seq(), 0, body)
+    def _challenge_from_ack(self, payload):
+        """Return the server's address-change challenge, or '' when this ACK is only a pong."""
+        if not payload or payload == b"PONG":
+            return ""
+        try:
+            data = json.loads(payload.decode("utf-8"))
+        except Exception:
+            return ""
+        challenge = data.get("challenge") if isinstance(data, dict) else ""
+        return challenge if isinstance(challenge, str) else ""
+
+    def _send_udp_heartbeat(self, challenge=""):
+        """
+        Authenticated UDP heartbeat.
+
+        The body is HMAC'd with the key derived from the login handshake. The login
+        token is not included. `challenge` is set only when answering the server's
+        proof for a new source address.
+        """
+        if not self.heartbeat_key or not self.udp_sock or not self.username:
+            return
+        with self.lock:
+            self.hb_counter += 1
+            counter = self.hb_counter
+        body = build_heartbeat(self.heartbeat_key, self.username, counter, self.udp_port, challenge)
+        ping = UDPPacket(TYPE_HEARTBEAT, 0, counter, 0, body)
         self.udp_sock.sendto(ping.encode(), (self.server_host, self.server_udp_port))
 
     def _heartbeat_loop(self):
@@ -615,13 +654,13 @@ class CollaborationClient:
         while self.running:
             if self.is_connected:
                 try:
-                    if self.udp_token and self.udp_sock:
+                    if self.heartbeat_key and self.udp_sock:
                         self._send_udp_heartbeat()
                 except OSError:
                     pass
                 try:
                     silent = time.time() - self.last_udp_pong
-                    need_tcp = (not self.udp_token) or silent > UDP_HEARTBEAT_MISSES * self.heartbeat_interval
+                    need_tcp = (not self.heartbeat_key) or silent > UDP_HEARTBEAT_MISSES * self.heartbeat_interval
                     if need_tcp and self.tcp_sock and self.running:
                         self._send_tcp(Packet(MsgType.HEARTBEAT_PING, payload=b"PING"))
                 except OSError:

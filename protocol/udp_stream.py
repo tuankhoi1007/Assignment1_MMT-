@@ -13,6 +13,9 @@ Fixed 24-byte header:
   TotalChunks (4B) | Len (2B) | Reserved (2B) | CRC32 (4B)
 """
 
+import hashlib
+import hmac
+import json
 import math
 import struct
 import threading
@@ -65,6 +68,52 @@ FLAG_NONE = 0x00
 FLAG_ENCRYPTED = 0x01
 FLAG_FIN = 0x02          # on an ACK: this ACK acknowledges a FIN
 FLAG_ABORT = 0x04        # on a FIN: transfer cancelled, discard partial data
+
+
+def _heartbeat_canonical(username, counter, udp_port, challenge):
+    """Stable bytes the heartbeat MAC covers. The token is not part of this."""
+    body = {
+        "challenge": challenge or "",
+        "counter": int(counter),
+        "udp_port": int(udp_port),
+        "username": str(username),
+    }
+    return json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def build_heartbeat(key, username, counter, udp_port, challenge=""):
+    """
+    Heartbeat body authenticated with HMAC-SHA256.
+
+    `key` is the udp-heartbeat key derived from the client-server X25519 handshake.
+    `counter` must increase on every send so a captured packet cannot be replayed.
+    `challenge` is empty until the server asks the sender to prove a new source address.
+    """
+    canonical = _heartbeat_canonical(username, counter, udp_port, challenge)
+    mac = hmac.new(key, canonical, hashlib.sha256).hexdigest()
+    fields = json.loads(canonical.decode("utf-8"))
+    fields["mac"] = mac
+    return json.dumps(fields, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def verify_heartbeat(key, data):
+    """True when `data` carries a MAC over the canonical heartbeat fields."""
+    if not isinstance(data, dict) or not key:
+        return False
+    mac = data.get("mac")
+    if not isinstance(mac, str) or len(mac) != 64:
+        return False
+    try:
+        canonical = _heartbeat_canonical(
+            data.get("username", ""),
+            int(data["counter"]),
+            int(data["udp_port"]),
+            str(data.get("challenge") or ""),
+        )
+    except (TypeError, ValueError, KeyError):
+        return False
+    expected = hmac.new(key, canonical, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, mac)
 
 
 def chunk_aad(stream_id, chunk_idx, total_chunks):
@@ -378,16 +427,24 @@ class StreamSender:
         self.fast_retx_pending = False
         self.start_time = None
         self.first_ack_time = None
+        self.fin_started = False
+        self.fin_retries = FIN_MAX_RETRIES
+        self._fin_thread = None
 
     def cancel(self):
-        """Stop sending and tell the peer to drop partial data (FIN + ABORT)."""
+        """Stop sending and run the FIN+ABORT handshake (retried until ACK'd)."""
+        start = False
         with self.lock:
-            if self.finished or self.aborted:
-                self.running = False
-                return
             self.running = False
             self.aborted = True
-        self._send_raw(UDPPacket(TYPE_FIN, self.stream_id, self.total_chunks, self.total_chunks, flags=FLAG_ABORT))
+            if not self.fin_started and not self.closed:
+                self.fin_started = True
+                start = True
+        if start:
+            self._fin_thread = threading.Thread(
+                target=self._fin_handshake, args=(FLAG_ABORT,), daemon=True, name=f"FIN-{self.stream_id}",
+            )
+            self._fin_thread.start()
 
     def handle_ack(self, ack_idx, flags=FLAG_NONE):
         """Record an ACK: RTT sample (Karn), congestion window, advance base."""
@@ -400,13 +457,17 @@ class StreamSender:
                 self.first_ack_time = time.time()
             if ack_idx in self.acked or not (0 <= ack_idx < self.total_chunks):
                 return
+            # Fast recovery: base has not yet moved past the chunk that was outstanding
+            # when loss was detected. ACKs in this window must not inflate cwnd.
+            in_recovery = self.recovery_point >= 0 and self.base <= self.recovery_point
             self.acked.add(ack_idx)
 
             sample = None
             if self.retransmit_counts.get(ack_idx, 0) == 0 and ack_idx in self.send_times:
                 sample = time.time() - self.send_times[ack_idx]
                 self.rtt.add_sample(sample)
-            self.cc.on_new_ack(rtt=sample if sample is not None else self.rtt.srtt)
+            if not in_recovery:
+                self.cc.on_new_ack(rtt=sample if sample is not None else self.rtt.srtt)
 
             if ack_idx > self.base and self.base not in self.acked:
                 # Later data arrived while `base` is still missing: same signal as a dup ACK.
@@ -421,6 +482,9 @@ class StreamSender:
                 self.base += 1
             if self.base != old_base:
                 self.dup_acks = 0
+            # Recovery ends once every chunk up through the recovery point is ACKed.
+            if self.recovery_point >= 0 and self.base > self.recovery_point:
+                self.recovery_point = -1
 
             if len(self.acked) >= self.total_chunks:
                 self.finished = True
@@ -507,11 +571,20 @@ class StreamSender:
                 self._send_raw(UDPPacket(TYPE_DATA, self.stream_id, idx, self.total_chunks, payload, flags))
             time.sleep(0.001 if to_send else 0.005)
 
-        if self.failed and not self.aborted:
-            self.aborted = True
-            self._send_raw(UDPPacket(TYPE_FIN, self.stream_id, self.total_chunks, self.total_chunks, flags=FLAG_ABORT))
-        elif self.finished and not self.aborted:
-            self._fin_handshake()
+        with self.lock:
+            if self.fin_started:
+                kind = None
+            elif self.failed:
+                self.fin_started = True
+                self.aborted = True
+                kind = FLAG_ABORT
+            elif self.finished:
+                self.fin_started = True
+                kind = FLAG_NONE
+            else:
+                kind = None
+        if kind is not None:
+            self._fin_handshake(kind)
         self.running = False
 
     def _mark_retransmit(self, idx, now, to_send):
@@ -525,16 +598,34 @@ class StreamSender:
         to_send.append(idx)
         return True
 
-    def _fin_handshake(self):
-        """Send FIN (type 3) until the receiver answers with ACK+FLAG_FIN."""
+    def _fin_handshake(self, flags=FLAG_NONE):
+        """
+        Send FIN until the receiver answers with ACK+FLAG_FIN.
+
+        `flags` is FLAG_ABORT when the transfer is being cancelled. Retries wait
+        an exponentially increasing interval, capped at MAX_RTO, so a lost FIN
+        (including a lost abort) is not a single shot.
+        """
+        aborting = bool(flags & FLAG_ABORT)
         interval = max(MIN_RTO, min(self.rtt.rto, 0.3))
-        for _ in range(FIN_MAX_RETRIES):
-            if self.closed or self.aborted or not self.running:
-                break
-            self._send_raw(UDPPacket(TYPE_FIN, self.stream_id, self.total_chunks, self.total_chunks))
+        for _ in range(self.fin_retries):
+            with self.lock:
+                if self.closed:
+                    return
+                if not aborting and (self.aborted or not self.running):
+                    return
+            self._send_raw(UDPPacket(
+                TYPE_FIN, self.stream_id, self.total_chunks, self.total_chunks, flags=flags,
+            ))
             deadline = time.time() + interval
-            while time.time() < deadline and not self.closed and self.running:
+            while time.time() < deadline:
+                with self.lock:
+                    if self.closed:
+                        return
+                    if not aborting and (self.aborted or not self.running):
+                        return
                 time.sleep(0.005)
+            interval = min(MAX_RTO, interval * 2.0)
 
     def stats(self):
         with self.lock:
