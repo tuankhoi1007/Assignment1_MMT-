@@ -4,9 +4,10 @@ CO3093 - Security layer: X25519 key agreement, HKDF-SHA256, AES-256-GCM.
 Each login mints a fresh X25519 key pair. Two uses follow from the same primitive:
 
 * Client <-> server: the handshake exchanges ephemeral public keys and both sides
-  derive a per-connection channel key. The password and the UDP heartbeat token
-  travel under that key. The server never learns a client's long-term private key
-  (there isn't one; keys are session keys).
+  derive a per-connection channel key. The password travels under that key.
+  A second derived key (context "udp-heartbeat") authenticates UDP heartbeats,
+  so the login token is never sent in the clear. The server never learns a
+  client's long-term private key (there isn't one; keys are session keys).
 * Client <-> client: chat and file chunks are encrypted with a key derived from
   X25519(my_private, peer_public). The server only relays public keys and
   ciphertext, so it cannot read them.
