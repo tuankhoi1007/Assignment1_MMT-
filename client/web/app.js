@@ -57,14 +57,17 @@ async function connectToServer() {
   const username = document.getElementById("input-username").value.trim();
   const host = (document.getElementById("input-host")?.value || "127.0.0.1").trim();
   const port = parseInt(document.getElementById("input-port")?.value || "8888", 10);
+  const password = document.getElementById("input-password")?.value || "";
+  const register = document.getElementById("input-register")?.checked || false;
 
   if (!username) return alert("Please enter username!");
+  if (register && password.length < 4) return alert("Password must be at least 4 characters to register!");
 
   try {
     const res = await fetch("/api/connect", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username, host, port })
+      body: JSON.stringify({ username, host, port, password, register })
     });
     const data = await res.json();
     if (data.success) {
@@ -120,8 +123,10 @@ function updateHeader(s) {
     txt.textContent = "Online";
     chip.classList.remove("hidden");
     document.getElementById("my-avatar").textContent = (s.username || "U")[0].toUpperCase();
-    document.getElementById("my-username").textContent = s.username;
-    document.getElementById("my-udp-port").textContent = "UDP: " + s.udp_port;
+    document.getElementById("my-username").textContent = s.username + (s.guest ? " (guest)" : "");
+    const badge = document.getElementById("my-udp-port");
+    badge.textContent = "UDP: " + s.udp_port;
+    badge.title = s.fingerprint ? ("Key fingerprint: " + s.fingerprint) : "";
     btn.textContent = "Disconnect";
     btn.className = "btn btn-secondary";
     btn.onclick = disconnectFromServer;
@@ -161,7 +166,7 @@ function updatePeers(peers, myUsername) {
       const pCount = unreadCounts[p.username] || 0;
       const badge = pCount > 0 ? `<span class="unread-badge">${pCount > 99 ? '99+' : pCount}</span>` : '';
       return `
-        <div class="peer-item ${currentChannel === p.username ? 'active' : ''}" onclick="selectChannel('${escapeHtml(p.username)}')">
+        <div class="peer-item ${currentChannel === p.username ? 'active' : ''}" onclick="selectChannel('${escapeHtml(p.username)}')" ${p.fingerprint ? `title="Key ${escapeHtml(p.fingerprint)}"` : ""}>
           <span class="avatar">${escapeHtml(p.username[0].toUpperCase())}</span>
           <div class="peer-meta">
             <span class="peer-name">${escapeHtml(p.username)}</span>
@@ -279,7 +284,8 @@ async function uploadAndSendFile() {
         body: JSON.stringify({
           target,
           filename: selectedFile.name,
-          content_b64: reader.result.split(",")[1]
+          content_b64: reader.result.split(",")[1],
+          force_relay: document.getElementById("force-relay")?.checked || false
         })
       });
       const data = await res.json();
@@ -307,7 +313,10 @@ function renderTransfers(transfers) {
   container.innerHTML = list.map(t => {
     const isDone = t.progress >= 100;
     const roleIcon = t.role === "sender" ? "⬆" : "⬇";
-    const status = isDone ? "Completed" : (t.role === "sender" ? "Sending..." : "Receiving...");
+    const via = t.path === "relay" ? "relay" : (t.path === "direct" ? "direct" : "");
+    const cwnd = t.cwnd != null ? `cwnd ${t.cwnd}` : "";
+    const extra = [via, cwnd].filter(Boolean).join(" · ");
+    const status = (isDone ? "Completed" : (t.role === "sender" ? "Sending..." : "Receiving...")) + (extra ? ` (${extra})` : "");
     const downloadName = t.saved_filename || t.filename;
 
     return `

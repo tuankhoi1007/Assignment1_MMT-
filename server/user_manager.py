@@ -4,12 +4,16 @@ Maintains thread-safe user records, active socket references, and heartbeat time
 """
 
 import time
+import secrets
 import threading
+
+from protocol.crypto import fingerprint
 
 
 class UserSession:
     """Represents an active client session."""
-    def __init__(self, username, tcp_sock, addr, udp_port=0):
+
+    def __init__(self, username, tcp_sock, addr, udp_port=0, pubkey=None):
         self.username = username
         self.tcp_sock = tcp_sock
         self.ip = addr[0]
@@ -18,30 +22,37 @@ class UserSession:
         self.last_heartbeat = time.time()
         self.authenticated = False
         self.lock = threading.RLock()
+        self.pubkey = pubkey
+        self.udp_token = secrets.token_hex(16)
+        self.udp_addr = None  # (ip, port) observed on a UDP heartbeat (may differ under NAT)
+        self.guest = False
 
     def to_dict(self):
-        """Serialize user information for peer discovery."""
+        """Serialize user information for peer discovery. The UDP token is not included."""
         return {
             "username": self.username,
             "ip": self.ip,
             "tcp_port": self.tcp_port,
             "udp_port": self.udp_port,
-            "last_active": self.last_heartbeat
+            "last_active": self.last_heartbeat,
+            "pubkey": self.pubkey,
+            "fingerprint": fingerprint(self.pubkey) if self.pubkey else None,
         }
 
 
 class UserManager:
     """Thread-safe registry of connected users."""
+
     def __init__(self):
         self._users = {}
         self._lock = threading.RLock()
 
-    def add_user(self, username, tcp_sock, addr, udp_port=0):
+    def add_user(self, username, tcp_sock, addr, udp_port=0, pubkey=None):
         """Register a new user session if the username is unique."""
         with self._lock:
             if username in self._users:
                 return None
-            session = UserSession(username, tcp_sock, addr, udp_port)
+            session = UserSession(username, tcp_sock, addr, udp_port, pubkey)
             self._users[username] = session
             return session
 
@@ -65,12 +76,14 @@ class UserManager:
         with self._lock:
             return [s for s in self._users.values() if s.authenticated]
 
-    def update_heartbeat(self, username):
-        """Update last active timestamp for a user."""
+    def update_heartbeat(self, username, udp_addr=None):
+        """Refresh last-active time, and the observed UDP address when the ping came over UDP."""
         with self._lock:
             user = self._users.get(username)
             if user:
                 user.last_heartbeat = time.time()
+                if udp_addr:
+                    user.udp_addr = udp_addr
 
     def cleanup_inactive_users(self, timeout_sec=15.0):
         """Remove users who have not sent a heartbeat within timeout period; returns removed sessions."""

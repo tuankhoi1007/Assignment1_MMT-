@@ -107,6 +107,13 @@
             </div>
           </div>
 
+          <div class="form-group form-check">
+            <label for="force-relay">
+              <input type="checkbox" id="force-relay">
+              Send through server relay
+            </label>
+          </div>
+
           <button id="btn-send-file" class="btn btn-success full-width" onclick="uploadAndSendFile()" disabled>
             Start UDP Streaming Transfer
           </button>
@@ -131,6 +138,18 @@
       <div class="form-group">
         <label for="input-username">Username</label>
         <input type="text" id="input-username" placeholder="e.g. Alice or Bob" autofocus onkeydown="if(event.key==='Enter') connectToServer()">
+      </div>
+
+      <div class="form-group">
+        <label for="input-password">Password</label>
+        <input type="password" id="input-password" placeholder="Leave empty only if the server allows guests" onkeydown="if(event.key==='Enter') connectToServer()">
+      </div>
+
+      <div class="form-group form-check">
+        <label for="input-register">
+          <input type="checkbox" id="input-register">
+          Create new account
+        </label>
       </div>
 
       <div class="form-row">

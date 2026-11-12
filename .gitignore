@@ -22,4 +22,8 @@ client/downloads/*
 Slide_Assignment1.pdf
 Report_BTL1.pdf
 
+# Salted password database created by the server at runtime
+server/users.json
+server/users.json.tmp
+
 
