@@ -18,7 +18,7 @@ from protocol.udp_stream import StreamSender, StreamReceiver, UDPPacket, TYPE_DA
 
 class TestUDPStream(unittest.TestCase):
     def test_selective_repeat_with_simulated_loss(self):
-        """Test Selective Repeat ARQ and sliding window (N=8) under 20% simulated packet loss."""
+        """Test Selective Repeat ARQ under 20% simulated packet loss."""
         class LossyPipe:
             def __init__(self, target_queue, loss_rate=0.2):
                 self.q = target_queue

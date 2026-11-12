@@ -6,6 +6,8 @@ Usage:
     python -m client.run_client Alice
     python -m client.run_client Bob
     python -m client.run_client Bob --host 192.168.1.15
+    python -m client.run_client Alice --password secret123 --register
+    python -m client.run_client Alice --password secret123
 """
 
 import argparse
@@ -28,10 +30,17 @@ def main():
     parser.add_argument("--port", type=int, default=8888, help="Server TCP Port (default: 8888)")
     parser.add_argument("--ui-port", type=int, default=5001, help="Local Web UI HTTP Port (default: 5001)")
     parser.add_argument("--no-browser", action="store_true", help="Do not automatically open browser")
+    parser.add_argument("--password", default=None, help="Account password (omit for guest login, if the server allows it)")
+    parser.add_argument("--register", action="store_true", help="Create the account, then log in")
+    parser.add_argument("--force-relay", action="store_true", help="Send files through the server UDP relay")
+    parser.add_argument("--congestion", default="cubic", choices=("cubic", "bbr"),
+                        help="UDP congestion controller (default: cubic)")
     args = parser.parse_args()
 
     username = (args.name or args.username).strip()
     client = CollaborationClient(server_host=args.host, server_tcp_port=args.port)
+    client.force_relay = args.force_relay
+    client.congestion = args.congestion
 
     # Start raw-socket HTTP Web UI server (auto-increments port if busy)
     web_server = RawSocketHTTPServer(client, host="127.0.0.1", port=args.ui_port)
@@ -39,7 +48,10 @@ def main():
     url = f"http://127.0.0.1:{web_server.port}"
 
     if username:
-        ok, msg = client.connect_and_login(username, host=args.host, port=args.port)
+        ok, msg = client.connect_and_login(
+            username, host=args.host, port=args.port,
+            password=args.password or None, register=args.register,
+        )
         status = f"Logged in as '{username}'" if ok else f"Login failed: {msg}"
         print(f"[+] {status} | Web UI: {url}", flush=True)
     else:

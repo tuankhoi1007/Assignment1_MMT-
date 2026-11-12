@@ -133,6 +133,10 @@ body {
   padding: 7px 10px; color: #ffffff; font-size: 12px; outline: none;
 }
 .form-group input:focus, .form-group select:focus { border-color: #38bdf8; }
+.form-check label {
+  display: flex; align-items: center; gap: 8px; font-size: 12px; color: #e2e8f0; cursor: pointer;
+}
+.form-check input { width: auto; }
 .form-row { display: flex; gap: 8px; }
 .flex-1 { flex: 1; }
 .flex-2 { flex: 2; }
@@ -143,8 +147,9 @@ body {
   display: flex; align-items: center; justify-content: center; z-index: 100;
 }
 .modal-card {
-  width: 360px; max-width: calc(100vw - 32px); background: #131b2e;
-  border: 1px solid #232f48; border-radius: 10px; padding: 18px; display: flex; flex-direction: column; gap: 12px;
+  width: 360px; max-width: calc(100vw - 32px); max-height: calc(100vh - 32px); overflow-y: auto;
+  background: #131b2e; border: 1px solid #232f48; border-radius: 10px; padding: 18px;
+  display: flex; flex-direction: column; gap: 12px;
 }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
 .hidden { display: none !important; }

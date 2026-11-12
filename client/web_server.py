@@ -158,6 +158,7 @@ class RawSocketHTTPServer:
             "Access-Control-Allow-Origin: *",
             "Access-Control-Allow-Methods: GET, POST, PUT, OPTIONS",
             "Access-Control-Allow-Headers: Content-Type, Authorization, Cookie",
+            "Cache-Control: no-store",
             "Connection: close"
         ]
         if extra_headers:
@@ -193,6 +194,8 @@ class RawSocketHTTPServer:
                     "server_host": self.client.server_host,
                     "server_port": self.client.server_tcp_port,
                     "udp_port": self.client.udp_port,
+                    "fingerprint": self.client.my_fingerprint(),
+                    "guest": self.client.guest,
                     "active_users": self.client.active_users,
                     "users": self.client.active_users,
                     "peers": self.client.active_users,
@@ -242,7 +245,7 @@ class RawSocketHTTPServer:
             query_params = query_params or {}
 
             # 1. Peer registration & login (CO3094 Section 2.2 & 2.4: login API, submit-info API, connect-peer API)
-            if ep in ("/api/connect", "/login", "/connect-peer", "/submit-info"):
+            if ep in ("/api/connect", "/login", "/connect-peer", "/submit-info", "/register"):
                 cookies = parse_cookies(headers)
                 basic_user = parse_authorization(headers)
                 uname = (
@@ -262,7 +265,9 @@ class RawSocketHTTPServer:
                     self._send_json(conn, {"success": False, "message": "Username cannot be empty"}, 400)
                     return
 
-                ok, msg = self.client.connect_and_login(uname, host, port)
+                password = data.get("password") or None
+                register = bool(data.get("register")) or ep == "/register"
+                ok, msg = self.client.connect_and_login(uname, host, port, password=password, register=register)
                 extra = [f"Set-Cookie: session_user={uname}; Path=/; SameSite=Lax"] if ok else None
                 self._send_json(conn, {"success": ok, "message": msg, "username": uname}, extra_headers=extra)
 
@@ -298,7 +303,13 @@ class RawSocketHTTPServer:
                 file_bytes = base64.b64decode(content_b64) if content_b64 else None
                 file_path = data.get("file_path")
 
-                ok, msg = self.client.send_file(target, file_path=file_path, file_bytes=file_bytes, filename=filename)
+                use_relay = bool(data.get("force_relay")) or self.client.force_relay
+                previous = self.client.force_relay
+                self.client.force_relay = use_relay
+                try:
+                    ok, msg = self.client.send_file(target, file_path=file_path, file_bytes=file_bytes, filename=filename)
+                finally:
+                    self.client.force_relay = previous
                 self._send_json(conn, {"success": ok, "message": msg})
 
             # 5. Peer list management (CO3094 Section 2.4: add-list API, get-list API)

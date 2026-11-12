@@ -25,6 +25,7 @@ class MsgType(enum.IntEnum):
     AUTH_SUCCESS = 4
     AUTH_FAILURE = 5
     DISCONNECT = 6
+    AUTH_REGISTER = 7      # Create an account (username + password) and log in
 
     # State Management & Heartbeat (Steps 3 & 7)
     USER_JOINED = 12

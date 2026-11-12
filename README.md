@@ -11,9 +11,9 @@
 ## 1. Giới thiệu
 
 Hệ thống được xây dựng **100% bằng Socket thuần mức thấp** (`import socket`), hoàn toàn không sử dụng web framework bậc cao (Flask, Django, Tornado) hay WebSockets:
-- **TCP Signaling Plane (Port 8888):** Bắt tay 2 chiều, xác thực đăng nhập duy nhất, quản lý danh bạ online (Peer Discovery) và nhắn tin E2EE thời gian thực (Broadcast & Unicast).
-- **UDP Data Streaming Plane (Port 8889 / Dynamic):** Truyền file tin cậy độc lập với giải thuật **Selective Repeat ARQ** (cửa sổ trượt $N=8$, chunk 1200B $< 1500\text{B}$ MTU, đối soát SHA-256).
-- **Bảo mật Tầng Ứng dụng:** Mã hóa xác thực toàn trình **AES-256-GCM** (khóa 32B, nonce 12B).
+- **TCP Signaling Plane (Port 8888):** Bắt tay 2 chiều kèm trao đổi khóa X25519, đăng nhập bằng mật khẩu (scrypt), danh bạ online và nhắn tin end-to-end (Broadcast & Unicast).
+- **UDP Data Streaming Plane (Port 8889 / Dynamic):** Truyền file tin cậy bằng **Selective Repeat** + **CUBIC** (RTO thích nghi theo RFC 6298), chunk 1200B dưới MTU, đối soát SHA-256. Cổng 8889 của server vừa nhận heartbeat vừa relay file khi hai peer không gặp nhau trực tiếp.
+- **Bảo mật Tầng Ứng dụng:** AES-256-GCM với khóa riêng từng cặp peer (X25519 + HKDF). Server chỉ chuyển ciphertext.
 - **Web UI Socket thuần (Zero-Framework):** Tự xây dựng HTTP/1.1 server bằng socket phục vụ giao diện Web Dashboard, quản lý phiên Cookie RFC 6265, Basic Auth RFC 7235 và hiển thị thông báo tin nhắn chưa đọc.
 
 ---
@@ -32,27 +32,38 @@ Hệ thống được xây dựng **100% bằng Socket thuần mức thấp** (`
 
 ### Cách 1: Chạy trên cùng 1 máy tính (Localhost)
 
+Server mặc định **bắt buộc mật khẩu**. Tài khoản được ghi vào `server/users.json` (hash scrypt + salt, không lưu mật khẩu thô). Lần đầu dùng `--register`.
+
 Mở 3 cửa sổ Terminal riêng biệt:
 
 1. **Terminal 1 – Khởi động Server trung tâm:**
    ```bash
    python -m server.run_server
    ```
-   *(Server lắng nghe tại `0.0.0.0:8888` cho TCP và `8889` cho UDP).*
+   *(TCP `0.0.0.0:8888`, UDP `8889` cho heartbeat và relay file).*
 
-2. **Terminal 2 – Khởi động Client Alice:**
+2. **Terminal 2 – Đăng ký và đăng nhập Alice:**
    ```bash
-   python -m client.run_client Alice
+   python -m client.run_client Alice --password alice123 --register
    ```
-   *(Tự động mở trình duyệt Web Dashboard tại `http://127.0.0.1:5001`).*
+   *(Lần sau bỏ `--register`. Web Dashboard mở tại `http://127.0.0.1:5001`.)*
 
-3. **Terminal 3 – Khởi động Client Bob:**
+3. **Terminal 3 – Đăng ký và đăng nhập Bob:**
    ```bash
-   python -m client.run_client Bob
+   python -m client.run_client Bob --password bob123 --register
    ```
-   *(Tự động mở trình duyệt Web Dashboard tại `http://127.0.0.1:5002`).*
+   *(Web Dashboard tại `http://127.0.0.1:5002`.)*
 
-*(Bạn có thể mở thêm nhiều client khác như Trudy, David... bằng lệnh `python -m client.run_client <Tên>` tương tự).*
+Có thể đăng ký ngay trên Web UI: nhập username, password, tick **Create new account**, rồi Connect.
+
+Muốn chạy kiểu cũ (chỉ cần tên, không mật khẩu) thì khởi động server với `--allow-guest`:
+
+```bash
+python -m server.run_server --allow-guest
+python -m client.run_client Alice
+```
+
+Tên đã đăng ký vẫn phải đúng mật khẩu, kể cả khi bật guest.
 
 ---
 
@@ -66,13 +77,13 @@ Mở 3 cửa sổ Terminal riêng biệt:
      ```
    - Khởi động Client Alice:
      ```bash
-     python -m client.run_client Alice
+     python -m client.run_client Alice --password alice123 --register
      ```
 
 2. **Trên Máy 2 (Client Bob kết nối sang Máy 1):**
    - Chạy lệnh kết nối tới IP Máy 1:
      ```bash
-     python -m client.run_client Bob --host 192.168.1.15
+     python -m client.run_client Bob --host 192.168.1.15 --password bob123 --register
      ```
    *(Trình duyệt trên Máy 2 sẽ tự động mở Web UI và kết nối trực tiếp đến Server tại `192.168.1.15:8888`).*
 
@@ -88,23 +99,21 @@ Mở 3 cửa sổ Terminal riêng biệt:
 - **Truyền file UDP Streaming (📁):** 
   - Tại bảng bên phải, chọn người nhận trong menu *Recipient Peer*.
   - Nhấp *Select File* để chọn tệp tin bất kỳ từ máy tính.
-  - Bấm *Start UDP Streaming Transfer*: thanh tiến trình sẽ chạy mượt mà từ $0\%$ đến $100\%$.
+  - Bấm *Start UDP Streaming Transfer*: thanh tiến trình chạy từ $0\%$ đến $100\%$. Tick *Send through server relay* nếu muốn file đi qua UDP 8889 thay vì P2P.
   - Người nhận sẽ thấy nút **Open** để mở tệp ngay lập tức (tệp được lưu tại thư mục `client/downloads/`).
+  - Huy hiệu cạnh tên hiển thị cổng UDP; đưa chuột lên đó để xem fingerprint khóa công khai (so sánh ngoài băng với peer).
 
 ---
 
 ## 5. Chạy Kiểm Thử Tự Động (Unit Tests)
 
-Bộ kiểm thử tự động gồm **15 bài test** kiểm tra toàn bộ giao thức nhị phân, giải thuật Selective Repeat ARQ dưới 20% mất gói ngẫu nhiên, mô phỏng tải 15 clients đồng thời và REST API:
+Bộ test chạy trên localhost: framing TCP/UDP, AES-GCM, Selective Repeat (kể cả mất gói giả lập), 15 client đồng thời, REST API, và các cơ chế ở mục 7 (CUBIC, X25519, relay, FIN, mật khẩu, heartbeat UDP).
 
 ```bash
 python -m unittest discover tests -v
 ```
 
-**Kết quả mong đợi:**
-```text
-Ran 15 tests ... OK
-```
+Kết quả mong đợi: `Ran 39 tests ... OK`.
 
 ---
 
@@ -112,11 +121,63 @@ Ran 15 tests ... OK
 
 ```text
 assignment1/
-├── protocol/               # Giao thức TCP Framing 20B, CRC32, AES-256-GCM, UDP Selective Repeat
-├── server/                 # Server đa luồng TCP/UDP, quản lý phiên và Watchdog tự động
-├── client/                 # Client networking engine, Server HTTP socket thuần & Web Dashboard
+├── protocol/               # TCP 20B, UDP 24B, X25519 + AES-GCM, Selective Repeat + CUBIC
+├── server/                 # Server đa luồng, scrypt, relay UDP 8889, watchdog
+├── client/                 # Client engine, HTTP socket thuần và Web Dashboard
 │   ├── downloads/          # Thư mục lưu tệp nhận qua UDP
 │   └── web/                # Giao diện Web UI (index.html, style.css, app.js)
-├── tests/                  # Bộ 15 bài kiểm thử tự động hóa toàn diện
+├── tests/                  # Unit test và integration test trên localhost
 └── README.md               # Hướng dẫn cài đặt và vận hành
 ```
+
+---
+
+## 7. Các cơ chế bổ sung
+
+### 7.1. Kiểm soát nghẽn CUBIC và RTO thích nghi
+
+Cửa sổ gửi không còn cố định 8 chunk. `RttEstimator` tính SRTT và RTTVAR theo RFC 6298, rồi RTO = SRTT + max(G, 4·RTTVAR), kẹp trong khoảng 50 ms–3 s. Timeout thì RTO nhân đôi. Mẫu RTT chỉ lấy từ chunk gửi một lần (Karn).
+
+`CongestionController` là CUBIC (RFC 8312), đơn vị là chunk:
+
+- Slow start: +1 chunk mỗi ACK cho tới `ssthresh`.
+- Congestion avoidance: W(t) = C·(t−K)³ + W_max, với C = 0.4 và K = ∛(W_max·(1−β)/C), β = 0.7. Mỗi ACK tiến về phía max(W_cubic, W_est). Khi cwnd đang nằm trên đường cong, nhánh TCP-friendly tăng 1/cwnd mỗi ACK.
+- Mất gói (3 ACK của chunk đứng sau một lỗ hổng): ssthresh = cwnd·β, cwnd = ssthresh, và chỉ gửi lại chunk đó (fast retransmit). Nếu cwnd chưa đạt W_max cũ thì W_max mới = cwnd·(1+β)/2 (fast convergence).
+- Timeout: ssthresh = cwnd·β, cwnd = 1, quay lại slow start.
+
+`WINDOW_SIZE` (64) chỉ là trần flow-control. Cửa sổ thực tế là min(cwnd, trần đó).
+
+`--congestion bbr` chọn bộ điều khiển tùy chọn BBR-lite: cwnd bám bandwidth-delay product (gain 2 lúc startup, gain 1 sau đó). Một fast retransmit không nhân cửa sổ với β; timeout thì cửa sổ về giá trị ban đầu. Đây không phải BBR đầy đủ (không có chu kỳ pacing gain hay ProbeRTT).
+
+### 7.2. Trao đổi khóa X25519 (mã hóa đầu-cuối)
+
+Mỗi lần đăng nhập client tạo một cặp khóa X25519 mới.
+
+- Handshake: client gửi khóa công khai, server trả khóa tạm của kết nối. Hai bên tính khóa kênh bằng HKDF-SHA256. Mật khẩu và UDP token đi trong kênh này.
+- Chat unicast và từng file dùng khóa riêng của đúng cặp peer (`context` là `chat` hoặc `file:<stream_id>`). Broadcast là một ciphertext cho mỗi peer đang online, không phải một khóa chung.
+- Chunk file gắn thêm AAD (stream id, chỉ số chunk, tổng số chunk) nên không đổi chỗ các chunk cho nhau được.
+- Server không có khóa riêng của peer và không gọi giải mã trên chat hay file.
+
+Khóa công khai do server phân phối và không được chứng thực. Server đổi khóa thì chen giữa được. Fingerprint (16 hex đầu của SHA-256, hiện khi rê chuột lên cổng UDP) dùng để đối chiếu ngoài băng.
+
+### 7.3. Relay UDP cổng 8889
+
+Server bind UDP 8889 và chạy vòng nhận. `FILE_ANNOUNCE` đăng ký route `stream_id → (sender, target)`. Gói DATA/FIN được chuyển nguyên vẹn từ sender sang target; ACK đi ngược lại. Payload vẫn là ciphertext của hai peer.
+
+Đường mặc định là P2P tới IP và cổng UDP mà server thấy lúc login. Nếu sau 1 giây không có ACK nào, sender gửi lại toàn bộ phần chưa ACK qua relay (NAT hoặc firewall chặn P2P). Có thể buộc relay ngay từ đầu bằng `--force-relay` hoặc checkbox *Send through server relay* trên Web UI.
+
+### 7.4. Gói FIN (Type = 3)
+
+Khi mọi chunk đã được ACK, sender gửi FIN. Receiver trả ACK với cờ `FLAG_FIN` rồi xóa trạng thái nhận. Sender gửi lại FIN vài lần nếu ACK mất. Hủy giữa chừng thì FIN mang `FLAG_ABORT`: receiver bỏ dữ liệu dở và không ghép file.
+
+### 7.5. Đăng nhập bằng mật khẩu
+
+`server/credentials.py` lưu scrypt (N=2¹⁴, r=8, p=1) với salt ngẫu nhiên 16 byte trong `server/users.json`. File này có thể copy sang máy khác để dùng lại tài khoản. Mật khẩu sai hoặc gửi dạng plaintext (không qua khóa kênh) nhận `AUTH_FAILURE`. `AUTH_REGISTER` tạo tài khoản rồi đăng nhập luôn. `--allow-guest` chỉ mở cửa cho tên chưa đăng ký.
+
+### 7.6. Heartbeat và discovery trên UDP
+
+Đúng theo mục Techniques của đề, client gửi heartbeat UDP (type 4) tới cổng 8889, kèm token bí mật nhận lúc login. Server kiểm tra token (so sánh thời gian hằng số), cập nhật thời điểm sống, và ghi địa chỉ nguồn thật của gói — đây là địa chỉ dùng cho relay khi NAT đổi cổng. Server trả heartbeat ACK (type 5).
+
+Danh bạ (ai đang online, khóa công khai) vẫn đi trên TCP vì cần tin cậy. Nếu vài chu kỳ không thấy pong UDP, client gửi thêm `HEARTBEAT_PING` trên TCP để watchdog 15 giây không đá nhầm máy bị chặn UDP. Watchdog vẫn xóa session im lặng quá 15 giây và báo `USER_LEFT`.
+
+Sau khi login, socket TCP của session không còn recv-timeout. Heartbeat đi trên UDP nên đường TCP có thể im; timeout recv sẽ cắt nhầm session còn sống. Socket chưa login vẫn bị đóng sau 60 giây nếu không gửi gì.
